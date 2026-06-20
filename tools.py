@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,18 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+
+# ── search_listings config ──────────────────────────────────────────────────
+
+# Common function words stripped from the query so they don't count as keywords.
+STOPWORDS = {
+    "i", "im", "a", "an", "the", "for", "with", "under",
+    "and", "or", "to", "in", "of", "my", "looking",
+}
+
+# Listing fields a keyword can match against (high-signal, always string-ish).
+SCORE_FIELDS = ("title", "description", "style_tags")
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -35,6 +48,54 @@ def _get_groq_client():
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
+
+def _tokenize(text: str) -> set[str]:
+    """Lowercase `text` and return the set of word tokens (letters/digits)."""
+    # CRITICAL: same tokenizer is used for BOTH the query and listing text, so
+    # the two sides normalize identically (punctuation/case can't cause misses).
+    # [a-z0-9]+ grabs runs of letters/digits → punctuation falls away.
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _keywords(description: str) -> set[str]:
+    """Turn a query into a keyword set: tokenize, drop stopwords and bare digits."""
+    return {
+        word
+        for word in _tokenize(description)
+        # Drop function words ("for", "a") so they can't inflate scores (1c),
+        # and bare numbers ("30" from "under $30") — price is handled separately.
+        if word not in STOPWORDS and not word.isdigit()
+        # CRITICAL: drop single letters. Contractions split on the apostrophe
+        # ("I'm" → "i","m"), leaving debris like "m"/"s"/"t" that aren't real
+        # keywords. Size is its own parameter, so 1-char tokens never help here.
+        and len(word) > 1
+    }
+
+
+def _listing_text(listing: dict) -> set[str]:
+    """Collect the searchable word tokens from a listing's SCORE_FIELDS."""
+    parts: list[str] = []
+    for field in SCORE_FIELDS:
+        value = listing.get(field)
+        # CRITICAL: style_tags is a list — flatten it; other fields are strings.
+        if isinstance(value, list):
+            parts.extend(str(v) for v in value)
+        elif value is not None:
+            parts.append(str(value))
+    return _tokenize(" ".join(parts))
+
+
+def _size_matches(query_size: str, listing_size: str) -> bool:
+    """True if `query_size` is one of the listing size's tokens (case-insensitive).
+
+    Splits on non-alphanumeric chars so "M" matches "S/M" but not the "m" in
+    "One Size (adjustable)".
+    """
+    # CRITICAL: token match, NOT substring — splitting "S/M" → ["s","m"] lets
+    # "M" match while avoiding false positives (e.g. "m" inside other words).
+    tokens = re.split(r"[^a-z0-9]+", listing_size.lower())
+    return query_size.lower() in tokens
+
 
 def search_listings(
     description: str,
@@ -69,8 +130,37 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    # 1. Load every listing from the mock dataset.
+    listings = load_listings()
+
+    # 2. Reduce the query to meaningful keywords once, up front (1c).
+    keywords = _keywords(description)
+
+    scored: list[tuple[int, dict]] = []
+    for listing in listings:
+        # ---- FILTER FIRST (cheap guards before any scoring) ----
+        # Price ceiling is inclusive; skip the check entirely when not given.
+        if max_price is not None and listing["price"] > max_price:
+            continue
+        # Size filter uses token matching ("M" ⊆ "S/M"); skip when not given.
+        if size is not None and not _size_matches(size, listing["size"]):
+            continue
+
+        # ---- SCORE by keyword overlap (set intersection = shared words) ----
+        score = len(keywords & _listing_text(listing))
+
+        # 4. Drop anything with no keyword overlap — a kept item shares ≥1 word.
+        if score == 0:
+            continue
+
+        scored.append((score, listing))
+
+    # 5. Highest score first. Python's sort is STABLE, so ties keep the
+    #    original dataset order (no secondary sort key needed).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    # Hand back just the listing dicts, untouched (score stays out of the data).
+    return [listing for _, listing in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
